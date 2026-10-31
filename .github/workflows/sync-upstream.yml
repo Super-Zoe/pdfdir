@@ -1,0 +1,1821 @@
+# =============================================================================
+# sync-upstream.yml —— 自同步工作流（由 fork-selfsync/build.py 自动生成）
+#
+#   ⚠️  本文件由构建脚本生成，请勿手工编辑。
+#       源码位于 fork-selfsync/src/，改动请改源码后重新构建。
+#
+# 作用：把本仓库（fork）与上游仓库的分支 / 标签保持一致。
+#
+#   · 默认分支      = 上游默认分支 + 恰好 1 个工具提交（本文件所在提交）
+#   · 其他稳定分支  = 与上游完全一致（同一 SHA）
+#   · 稳定标签      = 与上游完全一致
+#   · 删除操作      = 全程阻断，上游的删除永不传递到本仓库
+#
+# 生成时的工具提交标识：[fork-selfsync]
+# 同步源上游：chroming/pdfdir
+# =============================================================================
+name: Sync Upstream
+
+on:
+  schedule:
+    # 每 3 天 UTC 04:00 自动同步
+    - cron: "0 4 */3 * *"
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "只演练不写入（不推送任何变更）"
+        type: boolean
+        default: false
+      default_branch:
+        description: "覆盖默认分支名"
+        type: string
+        default: ""
+      default_branch_mode:
+        description: "默认分支同步模式：lease=改写为上游+1提交 / merge=纯非强制合并"
+        type: string
+        default: ""
+
+permissions:
+  contents: write
+  issues: write
+
+concurrency:
+  group: sync-upstream-${{ github.repository }}
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    name: 镜像上游分支与标签
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      - name: 检出完整历史
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+          persist-credentials: true
+
+      - name: 安装删除阻断钩子（协议层第二道防线）
+        run: |
+          mkdir -p "$(git rev-parse --git-dir)/hooks"
+          cat > "$(git rev-parse --git-dir)/hooks/pre-push" <<'HOOK_EOF'
+          #!/usr/bin/env bash
+          # 拒绝任何删除远端引用的 push。
+          # 实测 Git 行为：删除时 local_ref = "(delete)"；新建时 remote_sha 才是全 0。
+          # 因此判断删除只能依据 local_ref，不能用 remote_sha 是否全 0。
+          set -u
+          blocked=0
+          while read -r local_ref local_sha remote_ref remote_sha; do
+            if [ "$local_ref" = "(delete)" ]; then
+              echo "pre-push 阻断：拒绝删除远端引用 $remote_ref" >&2
+              blocked=1
+              continue
+            fi
+            case "$local_ref" in
+              ":"|"") echo "pre-push 阻断：拒绝空源 refspec" >&2; blocked=1 ;;
+            esac
+          done
+          [ "$blocked" -eq 0 ] || exit 1
+          exit 0
+          HOOK_EOF
+          chmod +x "$(git rev-parse --git-dir)/hooks/pre-push"
+
+      - name: 执行同步与校验
+        env:
+          SELFSYNC_FORK_SLUG: ${{ github.repository }}
+          SELFSYNC_UPSTREAM_SLUG: "chroming/pdfdir"
+          SELFSYNC_UPSTREAM_URL: "https://github.com/chroming/pdfdir.git"
+          SELFSYNC_DEFAULT_BRANCH: "master"
+          SELFSYNC_BRANCH_INCLUDE: "master dev"
+          SELFSYNC_BRANCH_EXCLUDE: "dependabot/*"
+          SELFSYNC_TAG_INCLUDE: ""
+          SELFSYNC_TAG_EXCLUDE: ""
+          SELFSYNC_SYNC_TAGS: "true"
+          SELFSYNC_MAX_TAGS: "500"
+          SELFSYNC_DEFAULT_BRANCH_MODE: "lease"
+          SELFSYNC_ALLOW_DIVERGED_BRANCH_OVERWRITE: "false"
+          SELFSYNC_ALLOW_TAG_OVERWRITE: "false"
+          SELFSYNC_REQUIRE_EXACT_BRANCH_SET: "false"
+          SELFSYNC_REQUIRE_EXACT_TAG_SET: "false"
+          SELFSYNC_COMMIT_MARKER: "[fork-selfsync]"
+          SELFSYNC_COMMIT_MESSAGE: "chore(sync): maintain self-sync workflow [fork-selfsync]"
+          SELFSYNC_WORKFLOW_PATH: ".github/workflows/sync-upstream.yml"
+          SELFSYNC_PUSH_TOKEN: "${{ secrets.SELFSYNC_PUSH_TOKEN }}"
+          SELFSYNC_DRY_RUN: "${{ inputs.dry_run || 'false' }}"
+          SELFSYNC_REPORT_DIR: "${{ runner.temp }}/selfsync-report"
+        run: |
+          # --------------------------------------------------------------------------
+          # 内联来源: common.sh —— 公共函数库（日志 / 配置 / 工具）
+          # --------------------------------------------------------------------------
+          # =============================================================================
+          # common.sh —— 公共函数库：日志、配置、错误处理、公共 git 封装
+          #
+          # 被 sync.sh / verify.sh / notify.sh 共同 source。
+          # 依赖：bash 4+, git 2.20+
+          # =============================================================================
+
+          # 防止重复 source
+          [[ -n "${_SELFSYNC_COMMON_LOADED:-}" ]] && return 0
+          _SELFSYNC_COMMON_LOADED=1
+
+          # ----------------------------------------------------------------------------
+          # 日志
+          # ----------------------------------------------------------------------------
+          if [[ -t 1 ]] && [[ -z "${NO_COLOR:-}" ]]; then
+            _C_RED=$'\033[31m'; _C_YEL=$'\033[33m'; _C_GRN=$'\033[32m'
+            _C_BLU=$'\033[36m'; _C_DIM=$'\033[2m'; _C_RST=$'\033[0m'
+          else
+            _C_RED=""; _C_YEL=""; _C_GRN=""; _C_BLU=""; _C_DIM=""; _C_RST=""
+          fi
+
+          _ts() { date -u +"%Y-%m-%dT%H:%M:%SZ"; }
+
+          log_info() { printf '%s[INFO ]%s %s %s\n' "$_C_BLU" "$_C_RST" "$(_ts)" "$*"; }
+          log_ok()   { printf '%s[ OK  ]%s %s %s\n' "$_C_GRN" "$_C_RST" "$(_ts)" "$*"; }
+          log_warn() { printf '%s[WARN ]%s %s %s\n' "$_C_YEL" "$_C_RST" "$(_ts)" "$*"; }
+          log_err()  { printf '%s[ERROR]%s %s %s\n' "$_C_RED" "$_C_RST" "$(_ts)" "$*" >&2; }
+          log_debug(){ [[ -n "${SELFSYNC_DEBUG:-}" ]] && printf '%s[DEBUG]%s %s %s\n' "$_C_DIM" "$_C_RST" "$(_ts)" "$*" || true; }
+
+          # GitHub Actions 注解（不在 Actions 里时静默降级为普通日志）
+          gh_note()  { printf '::notice::%s\n' "$*"; }
+          gh_warn()  { printf '::warning::%s\n' "$*"; }
+          gh_error() { printf '::error::%s\n' "$*" >&2; }
+
+          die() { log_err "$*"; exit "${SELFSYNC_EXIT_CODE:-1}"; }
+
+          # 步骤横幅
+          section() {
+            printf '\n%s%s%s\n' "$_C_BLU" "════ $* ════" "$_C_RST"
+          }
+
+          # ----------------------------------------------------------------------------
+          # 配置
+          # ----------------------------------------------------------------------------
+          # 所有配置项都有安全默认值；环境变量优先级最高（便于 CI 注入 / 本地覆盖）。
+          selfsync_load_config() {
+            # --- 身份 ---
+            : "${SELFSYNC_FORK_SLUG:=${GITHUB_REPOSITORY:-}}"
+            : "${SELFSYNC_UPSTREAM_SLUG:=}"
+            : "${SELFSYNC_UPSTREAM_URL:=}"
+            : "${SELFSYNC_ORIGIN_URL:=}"
+
+            # --- 分支 ---
+            : "${SELFSYNC_DEFAULT_BRANCH:=main}"
+            : "${SELFSYNC_FORK_DEFAULT_BRANCH:=}"
+
+            # --- 推送令牌（关键）---
+            # GITHUB_TOKEN 是 GitHub App 令牌，被平台硬性禁止「创建/更新 .github/workflows/ 下的文件」。
+            # 而本工具的默认分支同步必然产生一个携带 sync-upstream.yml 的「工具提交」，
+            # 用 GITHUB_TOKEN 推送该提交会被 GitHub 直接拒绝（refusing to allow a GitHub App
+            # to create or update workflow ...）。
+            # 因此：当配置了 SELFSYNC_PUSH_TOKEN（一个具备 repo + workflow 权限的经典 PAT）时，
+            # 推送改用该令牌，否则回退到 GITHUB_TOKEN（此时默认分支同步一定会失败，仅非默认分支可用）。
+            : "${SELFSYNC_PUSH_TOKEN:=}"
+
+            # --- 工具提交 ---
+            : "${SELFSYNC_WORKFLOW_PATH:=.github/workflows/sync-upstream.yml}"
+            : "${SELFSYNC_COMMIT_MARKER:=[fork-selfsync]}"
+            : "${SELFSYNC_COMMIT_MESSAGE:=chore(sync): maintain self-sync workflow [fork-selfsync]}"
+            : "${SELFSYNC_COMMIT_AUTHOR_NAME:=github-actions[bot]}"
+            : "${SELFSYNC_COMMIT_AUTHOR_EMAIL:=41898282+github-actions[bot]@users.noreply.github.com}"
+
+            # --- 稳定分支白/黑名单（空格分隔的 glob 模式）---
+            : "${SELFSYNC_BRANCH_INCLUDE:=main master release release/* v[0-9]* v[0-9].[0-9]*}"
+            : "${SELFSYNC_BRANCH_EXCLUDE:=dependabot/* copilot/* auto-publish-changes-* tmp/* temp/* test/* experimental/* nightly/* ci/*}"
+
+            # --- 标签 ---
+            : "${SELFSYNC_SYNC_TAGS:=true}"
+            : "${SELFSYNC_TAG_INCLUDE:=}"
+            : "${SELFSYNC_TAG_EXCLUDE:=}"
+            : "${SELFSYNC_ALLOW_TAG_OVERWRITE:=false}"
+
+            # --- 同步策略 ---
+            # lease : 默认分支用 --force-with-lease 重写（维持"仅 +1 提交"不变式，推荐）
+            # merge : 默认分支用 --no-ff merge（纯快进推送，绝不强推，但领先提交数会增长）
+            : "${SELFSYNC_DEFAULT_BRANCH_MODE:=lease}"
+            # 是否同步上游的 .github/workflows/ 目录。
+            # 默认 false —— 因为 GITHUB_TOKEN 无法 create/update workflow 文件
+            # （GitHub 平台硬限制，'workflows' 不是合法 permissions 键）。
+            : "${SELFSYNC_KEEP_UPSTREAM_WORKFLOWS:=false}"
+            : "${SELFSYNC_ALLOW_DIVERGED_BRANCH_OVERWRITE:=false}"
+            : "${SELFSYNC_REQUIRE_EXACT_BRANCH_SET:=false}"
+            : "${SELFSYNC_REQUIRE_EXACT_TAG_SET:=false}"
+            : "${SELFSYNC_MAX_BRANCHES:=300}"
+            : "${SELFSYNC_MAX_TAGS:=500}"
+            : "${SELFSYNC_FETCH_TIMEOUT_SECONDS:=600}"
+            : "${SELFSYNC_DRY_RUN:=false}"
+
+            # --- 告警 ---
+            : "${SELFSYNC_ALERT_ISSUE_ENABLED:=true}"
+            : "${SELFSYNC_ALERT_ISSUE_LABEL:=sync-alert}"
+            : "${SELFSYNC_ALERT_WEBHOOK_SECRET:=SYNC_ALERT_WEBHOOK}"
+            : "${SELFSYNC_ALERT_WEBHOOK_FORMAT:=generic}"
+            : "${SELFSYNC_ALERT_TITLE_PREFIX:=[self-sync]}"
+
+            # --- 报告 ---
+            : "${SELFSYNC_REPORT_DIR:=${RUNNER_TEMP:-/tmp}/selfsync-report}"
+
+            export SELFSYNC_FORK_SLUG SELFSYNC_UPSTREAM_SLUG SELFSYNC_UPSTREAM_URL SELFSYNC_ORIGIN_URL
+            export SELFSYNC_PUSH_TOKEN
+            export SELFSYNC_DEFAULT_BRANCH SELFSYNC_FORK_DEFAULT_BRANCH
+            export SELFSYNC_WORKFLOW_PATH SELFSYNC_COMMIT_MARKER SELFSYNC_COMMIT_MESSAGE
+            export SELFSYNC_BRANCH_INCLUDE SELFSYNC_BRANCH_EXCLUDE
+            export SELFSYNC_SYNC_TAGS SELFSYNC_TAG_INCLUDE SELFSYNC_TAG_EXCLUDE SELFSYNC_ALLOW_TAG_OVERWRITE
+            export SELFSYNC_DEFAULT_BRANCH_MODE SELFSYNC_KEEP_UPSTREAM_WORKFLOWS
+            export SELFSYNC_ALLOW_DIVERGED_BRANCH_OVERWRITE
+            export SELFSYNC_REQUIRE_EXACT_BRANCH_SET SELFSYNC_REQUIRE_EXACT_TAG_SET
+            export SELFSYNC_MAX_BRANCHES SELFSYNC_MAX_TAGS SELFSYNC_DRY_RUN
+            export SELFSYNC_ALERT_ISSUE_ENABLED SELFSYNC_ALERT_ISSUE_LABEL SELFSYNC_ALERT_WEBHOOK_FORMAT
+            export SELFSYNC_ALERT_TITLE_PREFIX SELFSYNC_REPORT_DIR
+          }
+
+          # 上游 URL 推导：优先显式配置，否则用 slug 拼
+          selfsync_resolve_upstream_url() {
+            if [[ -z "$SELFSYNC_UPSTREAM_URL" && -n "$SELFSYNC_UPSTREAM_SLUG" ]]; then
+              SELFSYNC_UPSTREAM_URL="https://github.com/${SELFSYNC_UPSTREAM_SLUG}.git"
+            fi
+            [[ -n "$SELFSYNC_UPSTREAM_URL" ]] || die "未配置上游地址（SELFSYNC_UPSTREAM_URL / SELFSYNC_UPSTREAM_SLUG）"
+            export SELFSYNC_UPSTREAM_URL
+          }
+
+          # ----------------------------------------------------------------------------
+          # 推送令牌应用
+          # ----------------------------------------------------------------------------
+          # 把 origin 远端 URL 改写为「带令牌」的形式，使后续 git push 使用具备 workflow
+          # 写权限的令牌（经典 PAT），从而可以推送携带 .github/workflows/ 的工具提交。
+          # 未配置令牌时保持原样（回退到 GITHUB_TOKEN，默认分支同步将因平台限制失败）。
+          selfsync_apply_push_token() {
+            if [[ -z "$SELFSYNC_PUSH_TOKEN" ]]; then
+              log_warn "未配置 SELFSYNC_PUSH_TOKEN：推送将回退到 GITHUB_TOKEN，默认分支同步（携带 workflow 文件）会被 GitHub 拒绝。请为仓库添加具备 repo + workflow 权限的经典 PAT 并设为该 Secret。"
+              return 0
+            fi
+            if [[ -z "$SELFSYNC_FORK_SLUG" ]]; then
+              log_warn "无法应用推送令牌：SELFSYNC_FORK_SLUG 为空"
+              return 0
+            fi
+            local tok_url="https://x-access-token:${SELFSYNC_PUSH_TOKEN}@github.com/${SELFSYNC_FORK_SLUG}.git"
+            if ! git_read remote set-url origin "$tok_url"; then
+              log_err "应用推送令牌失败，推送将回退到 GITHUB_TOKEN"
+              return 1
+            fi
+            # 移除 actions/checkout 注入的 GITHUB_TOKEN 凭证头，避免与 URL 内嵌令牌冲突
+            # （同时带两个 Authorization 头会被 GitHub 拒绝）
+            git_read config --unset-all "http.https://github.com/.extraheader" 2>/dev/null || true
+            log_ok "已为 origin 应用推送令牌（具备 workflow 写权限，可推送含 .github/workflows 的提交）"
+          }
+
+          # ----------------------------------------------------------------------------
+          # 通用工具
+          # ----------------------------------------------------------------------------
+
+          # 判断字符串是否匹配 glob 模式集合（空格分隔）
+          # 用法: glob_match_any "release/*" "v[0-9]*" "$branch"
+          glob_match_any() {
+            local patterns="$1" target="$2" p
+            for p in $patterns; do
+              # shellcheck disable=SC2053
+              if [[ "$target" == $p ]]; then return 0; fi
+            done
+            return 1
+          }
+
+          # 稳定的分支判定：命中 include 且不命中 exclude
+          is_stable_branch() {
+            local branch="$1"
+            [[ -n "$branch" ]] || return 1
+            glob_match_any "$SELFSYNC_BRANCH_EXCLUDE" "$branch" && return 1
+            glob_match_any "$SELFSYNC_BRANCH_INCLUDE" "$branch" || return 1
+            return 0
+          }
+
+          # 稳定的标签判定
+          is_stable_tag() {
+            local tag="$1"
+            [[ -n "$tag" ]] || return 1
+            if [[ -n "$SELFSYNC_TAG_EXCLUDE" ]]; then
+              glob_match_any "$SELFSYNC_TAG_EXCLUDE" "$tag" && return 1
+            fi
+            if [[ -n "$SELFSYNC_TAG_INCLUDE" ]]; then
+              glob_match_any "$SELFSYNC_TAG_INCLUDE" "$tag" || return 1
+            fi
+            return 0
+          }
+
+          # 确保目录存在
+          ensure_dir() { mkdir -p "$1"; }
+
+          # 原子写文件
+          write_atomic() {
+            local path="$1" content="$2"
+            ensure_dir "$(dirname "$path")"
+            printf '%s\n' "$content" > "${path}.tmp"
+            mv -f "${path}.tmp" "$path"
+          }
+
+          # 命令是否存在
+          have_cmd() { command -v "$1" >/dev/null 2>&1; }
+
+          # 人类可读的字节数
+          human_size() {
+            local b="${1:-0}"
+            if have_cmd numfmt; then numfmt --to=iec --suffix=B "$b" 2>/dev/null || echo "${b}B"; else echo "${b}B"; fi
+          }
+
+          # --------------------------------------------------------------------------
+          # 内联来源: guard.sh —— 删除阻断层（命令拦截 / pre-push 钩子 / 推送白名单）
+          # --------------------------------------------------------------------------
+          # =============================================================================
+          # guard.sh —— 删除阻断层
+          #
+          # 目标：同步流程中**彻底阻断**任何删除语义，确保上游的删除动作永不被传递到 fork。
+          #
+          # 三层防护（自内向外）：
+          #   L1  命令级拦截  —— git_safe() 解析参数，命中删除类语义直接拒绝执行
+          #   L2  钩子级拦截  —— pre-push 钩子在 git 协议层拒绝删除 refspec
+          #   L3  参数白名单  —— push 只能通过 push_mirror_safe()，它只构造允许的 refspec
+          #
+          # 被删除类语义覆盖的操作：
+          #   · 删除远端分支 / 标签      git push --delete / :branch / --mirror
+          #   · 删除本地分支 / 标签      git branch -D / git tag -d
+          #   · 强推抹除历史            git push --force（非 lease 形式）
+          #   · 清理远端跟踪引用        git remote prune / git fetch --prune
+          #   · 回退历史                git reset --hard / git update-ref -d
+          #
+          # 依赖：common.sh
+          # =============================================================================
+
+          [[ -n "${_SELFSYNC_GUARD_LOADED:-}" ]] && return 0
+          _SELFSYNC_GUARD_LOADED=1
+
+          # ----------------------------------------------------------------------------
+          # L1：命令级拦截
+          # ----------------------------------------------------------------------------
+
+          # 判定一组参数中是否出现禁止的删除类语义
+          # 用法: guard_scan_args <git子命令> <参数...>
+          # 返回 0 = 允许；返回 1 = 命中禁止项（并打印原因）
+          guard_scan_args() {
+            local sub="$1"; shift
+            local arg prev="" has_force=0 has_force_with_lease=0
+
+            # --- 通用：--delete / -d / --prune / --mirror / --hard / -D ---
+            for arg in "$@"; do
+              case "$arg" in
+                --delete|--mirror|--prune|--prune-tags|--hard)
+                  log_err "阻断：检测到删除类参数 '${arg}'（子命令 ${sub}）"
+                  return 1 ;;
+                -D|--force)
+                  has_force=1 ;;
+                --force-with-lease|--force-with-lease=*)
+                  has_force_with_lease=1 ;;
+              esac
+            done
+
+            # --- push 专属 ---
+            if [[ "$sub" == "push" ]]; then
+              for arg in "$@"; do
+                # 形如 ":branch" 或 ":refs/heads/x" 的空源 refspec = 删除远端 ref
+                if [[ "$arg" == :* ]]; then
+                  log_err "阻断：检测到删除型 refspec '${arg}'（会删除远端引用）"
+                  return 1
+                fi
+                # --delete 已在上面拦截；这里补 -d 短参
+                if [[ "$arg" == "-d" ]]; then
+                  log_err "阻断：检测到 'git push -d'（删除远端分支）"
+                  return 1
+                fi
+              done
+              # 非 lease 形式的 --force = 抹除历史
+              if [[ $has_force -eq 1 && $has_force_with_lease -eq 0 ]]; then
+                log_err "阻断：检测到裸 --force（会抹除已有提交历史）"
+                return 1
+              fi
+              return 0
+            fi
+
+            # --- branch / tag 子命令 ---
+            if [[ "$sub" == "branch" || "$sub" == "tag" ]]; then
+              for arg in "$@"; do
+                if [[ "$arg" == "-d" || "$arg" == "-D" || "$arg" == "--delete" ]]; then
+                  log_err "阻断：检测到 'git ${sub} ${arg}'（删除引用）"
+                  return 1
+                fi
+              done
+              return 0
+            fi
+
+            # --- fetch / remote prune ---
+            if [[ "$sub" == "remote" ]]; then
+              for arg in "$@"; do
+                if [[ "$arg" == "prune" || "$arg" == "rm" || "$arg" == "remove" ]]; then
+                  log_err "阻断：检测到 'git remote ${arg}'（清理引用）"
+                  return 1
+                fi
+              done
+              return 0
+            fi
+
+            # --- update-ref -d ---
+            if [[ "$sub" == "update-ref" ]]; then
+              for arg in "$@"; do
+                if [[ "$arg" == "-d" || "$arg" == "--delete" ]]; then
+                  log_err "阻断：检测到 'git update-ref ${arg}'（删除引用）"
+                  return 1
+                fi
+              done
+              return 0
+            fi
+
+            return 0
+          }
+
+          # 受控的 git 调用入口。所有同步逻辑必须走这个函数。
+          # 用法: git_safe <子命令> [参数...]
+          git_safe() {
+            local sub="$1"; shift
+            if ! guard_scan_args "$sub" "$@"; then
+              return 1
+            fi
+            command git "$sub" "$@"
+          }
+
+          # 只读 git 调用（fetch / ls-remote / rev-parse 等），不涉及写操作
+          git_read() {
+            local sub="$1"; shift
+            case "$sub" in
+              fetch)
+                # fetch 是只读远端、只写本地跟踪引用；但 --prune 会删本地引用，仍阻断
+                guard_scan_args fetch "$@" || return 1
+                command git fetch "$@" ;;
+              ls-remote|rev-parse|show|log|diff|cat-file|for-each-ref|rev-list|status|config)
+                command git "$sub" "$@" ;;
+              *)
+                command git "$sub" "$@" ;;
+            esac
+          }
+
+          # ----------------------------------------------------------------------------
+          # L2：pre-push 钩子
+          # ----------------------------------------------------------------------------
+          # 在协议层拒绝任何删除型 refspec。即使有进程绕过 git_safe 直接调 git push，
+          # 钩子也会拦下。这是"纵深防御"的第二道。
+          guard_install_prepush_hook() {
+            local git_dir
+            git_dir="$(git rev-parse --git-dir 2>/dev/null)" || return 0
+            local hook_dir="${git_dir}/hooks"
+            local hook="${hook_dir}/pre-push"
+            ensure_dir "$hook_dir"
+
+            cat > "$hook" <<'HOOK_EOF'
+          #!/usr/bin/env bash
+          # 自动生成：self-sync 删除阻断钩子
+          # 拒绝任何删除远端引用的 push。
+          #
+          # pre-push 的 stdin 格式：<local_ref> <local_sha> <remote_ref> <remote_sha>
+          # 实测 Git 的真实行为（务必按此判断，否则会把「新建」误判为「删除」）：
+          #   · 删除已有引用：local_ref = "(delete)"  local_sha = 全0  remote_sha = 原有SHA
+          #   · 新建引用    ：local_ref = 实际 ref     local_sha = 真实SHA remote_sha = 全0
+          #   · 更新引用    ：local_ref = 实际 ref     local_sha = 真实SHA remote_sha = 旧SHA
+          #
+          # 因此判断删除的唯一可靠依据是 local_ref 是否为 "(delete)"，
+          # 而不是 remote_sha 是否为全 0（新建时它同样是全 0）。
+          set -u
+          blocked=0
+          while read -r local_ref local_sha remote_ref remote_sha; do
+            if [ "$local_ref" = "(delete)" ]; then
+              echo "pre-push 阻断：拒绝删除远端引用 ${remote_ref}" >&2
+              blocked=1
+              continue
+            fi
+            # 源 refspec 为空同样是删除语义
+            case "$local_ref" in
+              ":"|"") echo "pre-push 阻断：拒绝空源 refspec" >&2; blocked=1 ;;
+            esac
+          done
+          [ "$blocked" -eq 0 ] || exit 1
+          exit 0
+          HOOK_EOF
+            chmod +x "$hook"
+            log_debug "已安装 pre-push 阻断钩子：${hook}"
+          }
+
+          guard_remove_prepush_hook() {
+            local git_dir
+            git_dir="$(git rev-parse --git-dir 2>/dev/null)" || return 0
+            rm -f "${git_dir}/hooks/pre-push"
+          }
+
+          # ----------------------------------------------------------------------------
+          # L3：推送参数白名单
+          # ----------------------------------------------------------------------------
+          # push_mirror_safe <本地ref> <远端ref>
+          #   只推送「本地已有 → 远端同路径」，永不生成删除型 refspec。
+          #   这是唯一允许的推送入口。
+          push_mirror_safe() {
+            local src="$1" dst="$2"
+            # 二次防线：源/目标都不能为空（空 = 删除语义）
+            if [[ -z "$src" || -z "$dst" ]]; then
+              log_err "阻断：推送 refspec 不能为空"
+              return 1
+            fi
+            if [[ "$src" == :* || "$dst" == :* ]]; then
+              log_err "阻断：推送 refspec 不能以 ':' 开头（删除语义）"
+              return 1
+            fi
+            if [[ "$SELFSYNC_DRY_RUN" == "true" ]]; then
+              log_info "[dry-run] 将推送 ${src} → ${dst}"
+              return 0
+            fi
+            git_safe push origin "${src}:${dst}"
+          }
+
+          # 推送一个本地分支到远端同名分支（快进语义，不带 --force）
+          push_branch_ff() {
+            local branch="$1"
+            local src="refs/remotes/upstream/${branch}"
+            local dst="refs/heads/${branch}"
+            if [[ "$SELFSYNC_DRY_RUN" == "true" ]]; then
+              log_info "[dry-run] 将推送分支 ${src} → ${dst}（快进，非强制）"
+              return 0
+            fi
+            git_safe push origin "${src}:${dst}"
+          }
+
+          # 推送一个本地标签到远端同名标签
+          push_tag_safe() {
+            local tag="$1"
+            local src="refs/tags/${tag}"
+            local dst="refs/tags/${tag}"
+            if [[ "$SELFSYNC_DRY_RUN" == "true" ]]; then
+              log_info "[dry-run] 将推送标签 ${src} → ${dst}"
+              return 0
+            fi
+            git_safe push origin "${src}:${dst}"
+          }
+
+          # --------------------------------------------------------------------------
+          # 内联来源: sync.sh —— 同步主流程
+          # --------------------------------------------------------------------------
+          # =============================================================================
+          # sync.sh —— 上游 → fork 镜像同步主流程
+          #
+          # 同步目标：
+          #   1. 非默认分支：与上游 100% 一致（提交历史完全相同）
+          #   2. 默认分支   ：恰好比上游多 1 个「工具提交」（仅含工作流文件）
+          #   3. 标签       ：上游稳定标签全部镜像到 fork，内容一致
+          #   4. 删除       ：全程阻断，上游的删除动作永不传递到 fork
+          #
+          # 依赖：common.sh guard.sh
+          # =============================================================================
+
+          [[ -n "${_SELFSYNC_SYNC_LOADED:-}" ]] && return 0
+          _SELFSYNC_SYNC_LOADED=1
+
+          # 同步过程状态（供 verify.sh / notify.sh 读取）
+          declare -gA SYNC_BRANCH_STATUS=()   # branch -> status
+          declare -gA SYNC_BRANCH_DETAIL=()   # branch -> detail
+          declare -gA SYNC_TAG_STATUS=()      # tag -> status
+          declare -gA SYNC_TAG_DETAIL=()      # tag -> detail
+          declare -gA SYNC_DEVIATIONS=()      # 描述 -> 详情
+          declare -g SYNC_DEFAULT_BRANCH_STATUS=""
+          declare -g SYNC_DEFAULT_BRANCH_DETAIL=""
+          declare -g SYNC_STARTED_AT=""
+          declare -g SYNC_FINISHED_AT=""
+
+          # ----------------------------------------------------------------------------
+          # 远端准备
+          # ----------------------------------------------------------------------------
+          # 在同一仓库内建立两个远端：
+          #   origin   → 目标（自己的 fork）
+          #   upstream → 数据来源（上游仓库）
+          sync_setup_remotes() {
+            section "配置双远端（origin=fork / upstream=上游）"
+
+            selfsync_resolve_upstream_url
+
+            # origin 必须指向 fork 自身
+            local origin_url
+            origin_url="$(git_read config --get remote.origin.url || true)"
+            if [[ -z "$origin_url" ]]; then
+              log_err "未找到 origin 远端"
+              return 1
+            fi
+            if [[ -n "$SELFSYNC_ORIGIN_URL" && "$origin_url" != "$SELFSYNC_ORIGIN_URL" ]]; then
+              log_warn "origin URL 与配置不一致，按配置重设：${SELFSYNC_ORIGIN_URL}"
+              git_read remote set-url origin "$SELFSYNC_ORIGIN_URL"
+            fi
+
+            # upstream 远端（幂等）
+            local up_url
+            up_url="$(git_read config --get remote.upstream.url || true)"
+            if [[ -z "$up_url" ]]; then
+              log_info "新增 upstream 远端 → ${SELFSYNC_UPSTREAM_URL}"
+              git_read remote add upstream "$SELFSYNC_UPSTREAM_URL"
+            elif [[ "$up_url" != "$SELFSYNC_UPSTREAM_URL" ]]; then
+              log_info "更新 upstream 远端 → ${SELFSYNC_UPSTREAM_URL}"
+              git_read remote set-url upstream "$SELFSYNC_UPSTREAM_URL"
+            else
+              log_ok "upstream 远端已存在且一致"
+            fi
+
+            # 回读校验：确认两个远端都已真正落地（此前 remote add 失败会被静默吞掉）
+            local check_up
+            check_up="$(git_read config --get remote.upstream.url || true)"
+            if [[ -z "$check_up" ]]; then
+              log_err "upstream 远端配置失败"
+              return 1
+            fi
+            log_ok "远端就绪：origin=$(git_read config --get remote.origin.url)  upstream=${check_up}"
+
+            # 应用推送令牌：若配置了 SELFSYNC_PUSH_TOKEN，origin 改用具备 workflow 写权限的
+            # 令牌，否则默认分支同步（携带 workflow 文件）会被 GITHUB_TOKEN 拒绝。
+            selfsync_apply_push_token
+          }
+
+          # ----------------------------------------------------------------------------
+          # 抓取
+          # ----------------------------------------------------------------------------
+          sync_fetch() {
+            section "从上游抓取（不 prune，绝不清理引用）"
+
+            # 显式使用 +refspec 允许远端跟踪引用快进/强制更新，
+            # 但不携带 --prune，因此上游删除的分支不会从本地跟踪引用中移除，
+            # 也就绝不会被误判为「需要删除」。
+            log_info "抓取上游分支 → refs/remotes/upstream/*"
+            if ! git_read fetch --no-tags upstream \
+                  "+refs/heads/*:refs/remotes/upstream/*"; then
+              log_err "抓取上游分支失败"
+              return 1
+            fi
+
+            # 标签镜像到独立命名空间，避免污染本地标签命名空间
+            log_info "抓取上游标签 → refs/upstream-mirror/tags/*"
+            if ! git_read fetch --no-tags upstream \
+                  "+refs/tags/*:refs/upstream-mirror/tags/*"; then
+              log_warn "抓取上游标签失败，标签同步将跳过"
+              SYNC_DEVIATIONS["tag_fetch_failed"]="无法抓取上游标签"
+            fi
+            log_ok "抓取完成"
+          }
+
+          # ----------------------------------------------------------------------------
+          # 分支集合
+          # ----------------------------------------------------------------------------
+          # 列出上游稳定分支（已过滤 include/exclude）
+          sync_list_stable_upstream_branches() {
+            git_read for-each-ref --format='%(refname:strip=3)' refs/remotes/upstream \
+              | while read -r b; do
+                  [[ "$b" == "HEAD" ]] && continue
+                  is_stable_branch "$b" && echo "$b"
+                done \
+              | sort -u
+          }
+
+          # 列出 fork 已有的分支
+          # 注意 strip 层级：refs/remotes/origin/<branch> → strip=3 才得到 <branch>
+          sync_list_origin_branches() {
+            git_read for-each-ref --format='%(refname:strip=3)' refs/remotes/origin \
+              | while read -r b; do
+                  [[ "$b" == "HEAD" ]] && continue
+                  echo "$b"
+                done \
+              | sort -u
+          }
+
+          # ----------------------------------------------------------------------------
+          # 默认分支处理
+          # ----------------------------------------------------------------------------
+          # 构造「上游默认分支 tip + 恰好 1 个工具提交」的新提交
+          #
+          # 实现方式（不触碰工作区，精确控制 tree）：
+          #   1. 以 upstream/<default> 的 tree 为基线读入 index
+          #   2. 只把工作流文件这一个 blob 写入 index
+          #   3. write-tree 得到新 tree
+          #   4. commit-tree 以 upstream tip 为父提交生成工具提交
+          # 这样新提交的 tree 与上游 tree 的差异**有且仅有**工作流文件本身。
+          #
+          # 推送使用 --force-with-lease 并锁定期望的旧 SHA：
+          #   · 不会抹除任何上游提交（历史是上游的线性延伸）
+          #   · 若远端在此期间被他人改动，lease 校验失败，推送自动中止（不会覆盖他人改动）
+          #   · 不是删除语义，pre-push 钩子不会拦下
+          sync_update_default_branch() {
+            local def="$1"
+            SYNC_DEFAULT_BRANCH_STATUS=""
+            SYNC_DEFAULT_BRANCH_DETAIL=""
+
+            local upstream_ref="refs/remotes/upstream/${def}"
+            local origin_ref="refs/remotes/origin/${def}"
+
+            if ! git_read rev-parse --verify --quiet "$upstream_ref" >/dev/null; then
+              SYNC_DEFAULT_BRANCH_STATUS="failed"
+              SYNC_DEFAULT_BRANCH_DETAIL="上游无默认分支 ${def}"
+              return 1
+            fi
+
+            local upstream_tip
+            upstream_tip="$(git_read rev-parse "$upstream_ref")"
+
+            local origin_sha=""
+            if git_read rev-parse --verify --quiet "$origin_ref" >/dev/null; then
+              origin_sha="$(git_read rev-parse "$origin_ref")"
+            fi
+
+            # 远端当前实际的 SHA（origin_ref 可能是陈旧的跟踪值，以 ls-remote 为准）
+            local remote_sha=""
+            remote_sha="$(git_read ls-remote origin "refs/heads/${def}" 2>/dev/null | awk 'NR==1{print $1}')"
+
+            # 工作流文件：读取当前仓库中的该文件（由 Actions checkout 得到）
+            local wf_rel="${SELFSYNC_WORKFLOW_PATH}"
+            local wf_abs="${GITHUB_WORKSPACE:-$(pwd)}/${wf_rel}"
+            if [[ ! -f "$wf_abs" ]]; then
+              # 退化：在仓库根目录里找
+              wf_abs="$(git_read rev-parse --show-toplevel)/${wf_rel}"
+            fi
+            if [[ ! -f "$wf_abs" ]]; then
+              SYNC_DEFAULT_BRANCH_STATUS="failed"
+              SYNC_DEFAULT_BRANCH_DETAIL="找不到工作流文件 ${wf_rel}，无法构造工具提交"
+              return 1
+            fi
+
+            local blob mode
+            blob="$(git_read hash-object -w "$wf_abs")"
+            mode="$(git_read ls-files -s -- "$wf_rel" | awk 'NR==1{print $1}')"
+            [[ -n "$mode" ]] || mode="100644"
+
+            # 读入上游 tree 到临时 index
+            # 注意：不能用 `env GIT_INDEX_FILE=... git_read ...` —— env 只能执行外部命令，
+            # 无法调用 shell 函数。改为在当前 shell 内临时导出变量。
+            local idx
+            idx="$(mktemp)"
+            rm -f "$idx"
+
+            # 第一步：读入上游 tree
+            if ! ( export GIT_INDEX_FILE="$idx"; git_read read-tree "$upstream_tip" ); then
+              rm -f "$idx"
+              SYNC_DEFAULT_BRANCH_STATUS="failed"
+              SYNC_DEFAULT_BRANCH_DETAIL="读取上游 tree 失败"
+              return 1
+            fi
+
+            # 第二步：剔除上游的 .github/workflows/ 目录
+            #
+            # 原因（GitHub 平台限制）：GITHUB_TOKEN 无论声明什么 permissions，
+            # 都不能 create/update workflow 文件 —— GitHub 会直接拒绝：
+            #   "refusing to allow a GitHub App to create or update workflow
+            #    '.github/workflows/xxx.yml' without 'workflows' permission"
+            # 而 'workflows' 并不是合法的 permissions 键（合法键共 17 个，不含它），
+            # 官方给出的唯一出路是改用 GitHub App 或 PAT。
+            #
+            # 因此本方案的做法是：**默认分支不同步上游的 CI 工作流**，
+            # 只保留本工具自己的工作流文件。这样：
+            #   · 差异文件集合 == {本工具工作流文件}，仍是"恰好领先 1 个提交"
+            #   · 不需要 workflow 权限，sync 可用内置 GITHUB_TOKEN 完成
+            #   · 上游 CI 的失效由 fork 侧自行维护，不影响代码同步
+            local removed_wf=0
+            if [[ "$SELFSYNC_KEEP_UPSTREAM_WORKFLOWS" != "true" ]]; then
+              local wf_paths
+              wf_paths="$(git_read ls-tree -r --name-only "$upstream_tip" -- .github/workflows/ 2>/dev/null || true)"
+              if [[ -n "$wf_paths" ]]; then
+                # 用一条 git update-index --index-info 批量删除，
+                # 避免逐条调用时子 shell 的 GIT_INDEX_FILE 导出与错误吞掉问题。
+                # 格式：<mode> SP <sha> SP <stage> TAB <path>，用 0 000000 标记删除
+                local rm_spec="" wp
+                while IFS= read -r wp; do
+                  [[ -z "$wp" ]] && continue
+                  rm_spec+="0 0000000000000000000000000000000000000000 0"$'\t'"${wp}"$'\n'
+                  removed_wf=$((removed_wf+1))
+                done <<< "$wf_paths"
+                if [[ -n "$rm_spec" ]]; then
+                  if ! ( export GIT_INDEX_FILE="$idx"; printf '%s' "$rm_spec" | git_read update-index --index-info ); then
+                    rm -f "$idx"
+                    SYNC_DEFAULT_BRANCH_STATUS="failed"
+                    SYNC_DEFAULT_BRANCH_DETAIL="剔除上游工作流文件失败"
+                    return 1
+                  fi
+                  log_info "已从同步内容中剔除 ${removed_wf} 个上游工作流文件（平台限制：token 无法改 workflow）"
+                fi
+              fi
+            fi
+
+            # 第三步：只注入本工具的工作流文件
+            if ! ( export GIT_INDEX_FILE="$idx"
+                    git_read update-index --add --cacheinfo "${mode},${blob},${wf_rel}" ); then
+              rm -f "$idx"
+              SYNC_DEFAULT_BRANCH_STATUS="failed"
+              SYNC_DEFAULT_BRANCH_DETAIL="注入工作流文件失败"
+              return 1
+            fi
+
+            # 第四步：写出 tree
+            local new_tree
+            new_tree="$( export GIT_INDEX_FILE="$idx"; git_read write-tree )"
+            rm -f "$idx"
+            if [[ -z "$new_tree" ]]; then
+              SYNC_DEFAULT_BRANCH_STATUS="failed"
+              SYNC_DEFAULT_BRANCH_DETAIL="写出 tree 失败"
+              return 1
+            fi
+
+            # 生成工具提交：父提交 = 上游 tip
+            local new_commit
+            new_commit="$(
+              GIT_AUTHOR_NAME="$SELFSYNC_COMMIT_AUTHOR_NAME" \
+              GIT_AUTHOR_EMAIL="$SELFSYNC_COMMIT_AUTHOR_EMAIL" \
+              GIT_COMMITTER_NAME="$SELFSYNC_COMMIT_AUTHOR_NAME" \
+              GIT_COMMITTER_EMAIL="$SELFSYNC_COMMIT_AUTHOR_EMAIL" \
+              git_read commit-tree "$new_tree" -p "$upstream_tip" -m "$SELFSYNC_COMMIT_MESSAGE"
+            )"
+
+            # 校验：新提交与上游 tip 的差异文件必须**只有**工作流文件
+            # 允许的额外差异：上游 .github/workflows/ 下的文件（因平台限制被刻意剔除）
+            local diff_files
+            diff_files="$(git_read diff --name-only "$upstream_tip" "$new_commit" | sort -u)"
+            # 校验：差异文件集合必须恰好是
+            #   {本工具工作流文件} ∪ {上游 .github/workflows/ 下被刻意剔除的文件}
+            # 关键：本工具文件本身也在 .github/workflows/ 下，不能把「所有 .github/workflows/
+            # 文件」整体剔除——那会把本工具文件也误删。正确做法：
+            #   ① 任何不在 .github/workflows/ 下的差异文件都属异常
+            #   ② 本工具工作流文件必须出现在差异中
+            local unexpected
+            unexpected="$(printf '%s\n' "$diff_files" | grep -v '^\.github/workflows/' | grep -v '^$' || true)"
+            if [[ -n "$unexpected" ]]; then
+              SYNC_DEFAULT_BRANCH_STATUS="failed"
+              SYNC_DEFAULT_BRANCH_DETAIL="工具提交引入了非预期差异文件：${unexpected}"
+              return 1
+            fi
+            if ! printf '%s\n' "$diff_files" | grep -qx "$wf_rel"; then
+              SYNC_DEFAULT_BRANCH_STATUS="failed"
+              SYNC_DEFAULT_BRANCH_DETAIL="工具提交未包含本工具工作流文件 ${wf_rel}"
+              return 1
+            fi
+            log_info "差异文件校验通过（含本工具工作流文件，另 ${removed_wf} 个上游工作流文件被剔除，属平台限制下的预期行为）"
+
+            # 校验：领先上游恰好 1 个提交
+            local ahead
+            ahead="$(git_read rev-list --count "$upstream_tip..$new_commit")"
+            if [[ "$ahead" != "1" ]]; then
+              SYNC_DEFAULT_BRANCH_STATUS="failed"
+              SYNC_DEFAULT_BRANCH_DETAIL="工具提交领先数应为 1，实际 ${ahead}"
+              return 1
+            fi
+
+            # 无变化则跳过（避免无谓的分支改写）
+            if [[ -n "$origin_sha" && "$origin_sha" == "$new_commit" ]]; then
+              SYNC_DEFAULT_BRANCH_STATUS="unchanged"
+              SYNC_DEFAULT_BRANCH_DETAIL="默认分支已与上游 +1 工具提交一致"
+              log_ok "默认分支 ${def} 已是目标状态，无需更新"
+              return 0
+            fi
+
+            if [[ "$SELFSYNC_DRY_RUN" == "true" ]]; then
+              SYNC_DEFAULT_BRANCH_STATUS="planned"
+              SYNC_DEFAULT_BRANCH_DETAIL="[dry-run] 将把 ${def} 改写为 ${new_commit:0:8}（上游 tip + 1 工具提交）"
+              log_info "$SYNC_DEFAULT_BRANCH_DETAIL"
+              return 0
+            fi
+
+            # 推送：--force-with-lease 锁定旧 SHA，防止覆盖并发的人工改动
+            local lease_ref="refs/heads/${def}"
+            local expected_old="$remote_sha"
+            [[ -z "$expected_old" ]] && expected_old="$origin_sha"
+
+            local push_out rc=0
+            if [[ "$SELFSYNC_DEFAULT_BRANCH_MODE" == "lease" ]]; then
+              log_info "推送默认分支 ${def}（--force-with-lease，期望旧 SHA ${expected_old:0:8}）"
+              push_out="$(git_safe push --force-with-lease="${lease_ref}:${expected_old}" \
+                          origin "${new_commit}:${lease_ref}" 2>&1)" || rc=$?
+            else
+              # merge 模式：纯非强制推送，但领先提交数会变成 2
+              log_info "推送默认分支 ${def}（merge 模式，非强制）"
+              push_out="$(git_safe push origin "${new_commit}:${lease_ref}" 2>&1)" || rc=$?
+            fi
+
+            if [[ $rc -ne 0 ]]; then
+              SYNC_DEFAULT_BRANCH_STATUS="failed"
+              SYNC_DEFAULT_BRANCH_DETAIL="推送默认分支失败：$(printf '%s' "$push_out" | tail -3 | tr '\n' ' ')"
+              log_err "$SYNC_DEFAULT_BRANCH_DETAIL"
+              return 1
+            fi
+
+            SYNC_DEFAULT_BRANCH_STATUS="synced"
+            SYNC_DEFAULT_BRANCH_DETAIL="已改写为 ${new_commit:0:8}（上游 tip ${upstream_tip:0:8} + 1 工具提交）"
+            log_ok "默认分支 ${def} ${SYNC_DEFAULT_BRANCH_DETAIL}"
+            return 0
+          }
+
+          # ----------------------------------------------------------------------------
+          # 非默认分支处理
+          # ----------------------------------------------------------------------------
+          # 逐个分支对齐上游。策略：
+          #   · 远端无此分支        → 创建（快进语义，非强制）
+          #   · 远端 = 上游         → 跳过
+          #   · 远端是上游祖先      → 快进推送（非强制）
+          #   · 已分叉              → 默认**不动**，报告为偏差
+          #                          （改动分叉分支需要强推，与「非强制」原则冲突，
+          #                            需显式开启 SELFSYNC_ALLOW_DIVERGED_BRANCH_OVERWRITE）
+          sync_sync_branches() {
+            local def="$1"
+            section "同步非默认分支（快进推送，绝不强推）"
+
+            local upstream_branches origin_branches
+            mapfile -t upstream_branches < <(sync_list_stable_upstream_branches)
+            mapfile -t origin_branches < <(sync_list_origin_branches)
+
+            if [[ ${#upstream_branches[@]} -gt "$SELFSYNC_MAX_BRANCHES" ]]; then
+              log_warn "上游稳定分支数 ${#upstream_branches[@]} 超过上限 ${SELFSYNC_MAX_BRANCHES}，截断处理"
+              upstream_branches=("${upstream_branches[@]:0:$SELFSYNC_MAX_BRANCHES}")
+            fi
+
+            local synced=0 skipped=0 created=0 failed=0 diverged=0
+            local branch origin_sha upstream_sha
+
+            for branch in "${upstream_branches[@]}"; do
+              [[ "$branch" == "$def" ]] && continue
+
+              upstream_sha="$(git_read rev-parse --verify "refs/remotes/upstream/${branch}" 2>/dev/null || true)"
+              [[ -n "$upstream_sha" ]] || continue
+
+              # 同理：不存在时 git rev-parse 会回退输出原始字符串，必须严格校验
+              origin_sha=""
+              if git_read rev-parse --verify --quiet "refs/remotes/origin/${branch}" >/dev/null 2>&1; then
+                origin_sha="$(git_read rev-parse --verify "refs/remotes/origin/${branch}")"
+              fi
+
+              if [[ -z "$origin_sha" ]]; then
+                # 远端没有该分支 → 创建
+                if push_branch_ff "$branch"; then
+                  SYNC_BRANCH_STATUS["$branch"]="created"
+                  SYNC_BRANCH_DETAIL["$branch"]="新建并对齐上游 ${upstream_sha:0:8}"
+                  created=$((created+1))
+                else
+                  SYNC_BRANCH_STATUS["$branch"]="failed"
+                  SYNC_BRANCH_DETAIL["$branch"]="创建失败"
+                  failed=$((failed+1))
+                fi
+                continue
+              fi
+
+              if [[ "$origin_sha" == "$upstream_sha" ]]; then
+                SYNC_BRANCH_STATUS["$branch"]="unchanged"
+                SYNC_BRANCH_DETAIL["$branch"]="已与上游一致 ${upstream_sha:0:8}"
+                skipped=$((skipped+1))
+                continue
+              fi
+
+              # 判断是否快进
+              if git_read merge-base --is-ancestor "$origin_sha" "$upstream_sha" 2>/dev/null; then
+                if push_branch_ff "$branch"; then
+                  SYNC_BRANCH_STATUS["$branch"]="synced"
+                  SYNC_BRANCH_DETAIL["$branch"]="快进 ${origin_sha:0:8} → ${upstream_sha:0:8}"
+                  synced=$((synced+1))
+                else
+                  SYNC_BRANCH_STATUS["$branch"]="failed"
+                  SYNC_BRANCH_DETAIL["$branch"]="快进推送失败"
+                  failed=$((failed+1))
+                fi
+                continue
+              fi
+
+              # 分叉
+              if [[ "$SELFSYNC_ALLOW_DIVERGED_BRANCH_OVERWRITE" == "true" ]]; then
+                log_warn "分支 ${branch} 已分叉，按配置执行 --force-with-lease 对齐"
+                local expected
+                expected="$(git_read ls-remote origin "refs/heads/${branch}" 2>/dev/null | awk 'NR==1{print $1}')"
+                if git_safe push --force-with-lease="refs/heads/${branch}:${expected}" \
+                     origin "refs/remotes/upstream/${branch}:refs/heads/${branch}"; then
+                  SYNC_BRANCH_STATUS["$branch"]="reset"
+                  SYNC_BRANCH_DETAIL["$branch"]="分叉已按配置强制对齐上游 ${upstream_sha:0:8}"
+                  synced=$((synced+1))
+                else
+                  SYNC_BRANCH_STATUS["$branch"]="failed"
+                  SYNC_BRANCH_DETAIL["$branch"]="分叉强制对齐失败"
+                  failed=$((failed+1))
+                fi
+              else
+                SYNC_BRANCH_STATUS["$branch"]="diverged"
+                local ahead behind
+                ahead="$(git_read rev-list --count "${upstream_sha}..${origin_sha}" 2>/dev/null || echo '?')"
+                behind="$(git_read rev-list --count "${origin_sha}..${upstream_sha}" 2>/dev/null || echo '?')"
+                SYNC_BRANCH_DETAIL["$branch"]="已分叉（fork 独有 ${ahead} 提交 / 落后上游 ${behind} 提交），未强制覆盖"
+                SYNC_DEVIATIONS["diverged:${branch}"]="fork 独有 ${ahead} 提交，落后 ${behind} 提交"
+                diverged=$((diverged+1))
+              fi
+            done
+
+            # 记录 fork 独有（上游已删除）的分支 —— 不删除，只报告
+            #
+            # 关键：必须用 ls-remote 查上游的**实时**分支列表。
+            # 因为禁用 --prune，本地 refs/remotes/upstream/* 会保留上游已删除分支的引用，
+            # 用它判断会导致「上游明明删了分支却看不出来」。
+            local live_upstream=()
+            mapfile -t live_upstream < <(git_read ls-remote --heads upstream 2>/dev/null \
+              | awk '{print $2}' | sed 's|refs/heads/||' | sort -u)
+
+            local b
+            for b in "${origin_branches[@]}"; do
+              [[ "$b" == "$def" ]] && continue
+              local found=0 u
+              for u in "${live_upstream[@]}"; do
+                if [[ "$u" == "$b" ]]; then found=1; break; fi
+              done
+              if [[ $found -eq 0 ]]; then
+                SYNC_DEVIATIONS["origin_only_branch:${b}"]="上游已无此分支，fork 侧保留（删除被阻断）"
+                log_warn "分支 ${b}：上游已不存在，保留 fork 副本（删除操作被阻断）"
+              fi
+            done
+
+            log_ok "非默认分支处理完成：新建 ${created} / 更新 ${synced} / 无变化 ${skipped} / 分叉 ${diverged} / 失败 ${failed}"
+            SYNC_BRANCH_SUMMARY="新建 ${created} / 更新 ${synced} / 无变化 ${skipped} / 分叉 ${diverged} / 失败 ${failed}"
+          }
+
+          # ----------------------------------------------------------------------------
+          # 标签处理
+          # ----------------------------------------------------------------------------
+          sync_sync_tags() {
+            section "同步标签（镜像内容，绝不删除）"
+
+            if [[ "$SELFSYNC_SYNC_TAGS" != "true" ]]; then
+              log_info "标签同步已关闭（SELFSYNC_SYNC_TAGS=false）"
+              return 0
+            fi
+
+            local upstream_tags
+            mapfile -t upstream_tags < <(
+              git_read for-each-ref --format='%(refname:strip=3)' refs/upstream-mirror/tags \
+                | while read -r t; do is_stable_tag "$t" && echo "$t"; done \
+                | sort -u
+            )
+
+            if [[ ${#upstream_tags[@]} -gt "$SELFSYNC_MAX_TAGS" ]]; then
+              log_warn "上游标签数超过上限，截断处理"
+              upstream_tags=("${upstream_tags[@]:0:$SELFSYNC_MAX_TAGS}")
+            fi
+
+            local synced=0 skipped=0 failed=0 conflict=0
+            local tag upstream_sha origin_sha
+
+            for tag in "${upstream_tags[@]}"; do
+              upstream_sha="$(git_read rev-parse --verify "refs/upstream-mirror/tags/${tag}" 2>/dev/null || true)"
+              [[ -n "$upstream_sha" ]] || continue
+
+              # 关键：git rev-parse 对不存在的引用会回退输出原始字符串，
+              # 必须用 --verify 严格校验，否则会把 "refs/tags/x" 当成 SHA 用。
+              origin_sha=""
+              if git_read rev-parse --verify --quiet "refs/tags/${tag}" >/dev/null 2>&1; then
+                origin_sha="$(git_read rev-parse --verify "refs/tags/${tag}")"
+              fi
+
+              if [[ -z "$origin_sha" ]]; then
+                # 平台限制：GITHUB_TOKEN 不能创建指向「含 workflow 文件的 commit」的引用
+                # （GitHub: refusing to allow a GitHub App to create or update workflow ...）
+                # 因此这类标签一律跳过，只记录不报错。
+                # 仅当回退到 GITHUB_TOKEN（无推送令牌）时才因平台限制跳过；
+                # 若已配置具备 workflow 权限的推送令牌（PAT），则可正常推送这类标签。
+                if [[ -z "$SELFSYNC_PUSH_TOKEN" && "$SELFSYNC_KEEP_UPSTREAM_WORKFLOWS" != "true" ]] && tag_has_workflow "$upstream_sha"; then
+                  SYNC_TAG_STATUS["$tag"]="skipped"
+                  SYNC_TAG_DETAIL["$tag"]="目标 commit 含 workflow 文件，token 无权创建（平台限制，已跳过）"
+                  skipped=$((skipped+1))
+                  continue
+                fi
+                # 远端没有 → 推送
+                if git_safe push origin "refs/upstream-mirror/tags/${tag}:refs/tags/${tag}"; then
+                  # 同步本地标签引用，保持本地状态与远端一致
+                  # （否则本地缺少该 ref，后续「一致 / 冲突」判断会读到陈旧状态）
+                  git_safe update-ref "refs/tags/${tag}" "$upstream_sha" || true
+                  SYNC_TAG_STATUS["$tag"]="created"
+                  SYNC_TAG_DETAIL["$tag"]="新建 ${upstream_sha:0:8}"
+                  synced=$((synced+1))
+                else
+                  SYNC_TAG_STATUS["$tag"]="failed"
+                  SYNC_TAG_DETAIL["$tag"]="创建失败"
+                  failed=$((failed+1))
+                fi
+                continue
+              fi
+
+              if [[ "$origin_sha" == "$upstream_sha" ]]; then
+                SYNC_TAG_STATUS["$tag"]="unchanged"
+                SYNC_TAG_DETAIL["$tag"]="内容一致"
+                skipped=$((skipped+1))
+                continue
+              fi
+
+              # 同名不同内容
+              if [[ "$SELFSYNC_ALLOW_TAG_OVERWRITE" == "true" ]]; then
+                # 使用 --force-with-lease（锁定旧 SHA）而非裸 --force：既满足"按配置覆盖冲突
+                # 标签"的意图，又避免抹除并发改动的历史。guard.sh 的 L1 拦截只放行
+                # --force-with-lease，裸 --force 一律阻断（见 guard_scan_args）。
+                local expected
+                expected="$(git_read ls-remote origin "refs/tags/${tag}" 2>/dev/null | awk 'NR==1{print $1}')"
+                if git_safe push --force-with-lease="refs/tags/${tag}:${expected}" \
+                     origin "refs/upstream-mirror/tags/${tag}:refs/tags/${tag}"; then
+                  # 同步本地标签引用，避免本地仍指向被覆盖前的旧 SHA
+                  git_safe update-ref "refs/tags/${tag}" "$upstream_sha" || true
+                  SYNC_TAG_STATUS["$tag"]="reset"
+                  SYNC_TAG_DETAIL["$tag"]="内容冲突已按配置覆盖（--force-with-lease）"
+                  synced=$((synced+1))
+                else
+                  SYNC_TAG_STATUS["$tag"]="failed"
+                  SYNC_TAG_DETAIL["$tag"]="覆盖失败"
+                  failed=$((failed+1))
+                fi
+              else
+                SYNC_TAG_STATUS["$tag"]="conflict"
+                SYNC_TAG_DETAIL["$tag"]="内容冲突（fork ${origin_sha:0:8} / 上游 ${upstream_sha:0:8}），未覆盖"
+                SYNC_DEVIATIONS["tag_conflict:${tag}"]="同名不同内容"
+                conflict=$((conflict+1))
+              fi
+            done
+
+            # fork 独有标签 → 只报告，不删除
+            # 同样必须用 ls-remote 查上游实时标签（本地镜像命名空间会保留已删标签）
+            local live_tags=()
+            mapfile -t live_tags < <(git_read ls-remote --tags upstream 2>/dev/null \
+              | grep -v '\^{}' | awk '{print $2}' | sed 's|refs/tags/||' | sort -u)
+
+            local t
+            while read -r t; do
+              [[ -z "$t" ]] && continue
+              local found=0 lt
+              for lt in "${live_tags[@]}"; do
+                if [[ "$lt" == "$t" ]]; then found=1; break; fi
+              done
+              if [[ $found -eq 0 ]]; then
+                SYNC_DEVIATIONS["origin_only_tag:${t}"]="上游已无此标签，fork 侧保留（删除被阻断）"
+                log_warn "标签 ${t}：上游已不存在，保留 fork 副本（删除操作被阻断）"
+              fi
+            done < <(git_read for-each-ref --format='%(refname:strip=2)' refs/tags 2>/dev/null || true)
+
+            log_ok "标签处理完成：新建/更新 ${synced} / 一致 ${skipped} / 冲突 ${conflict} / 失败 ${failed}"
+            SYNC_TAG_SUMMARY="新建/更新 ${synced} / 一致 ${skipped} / 冲突 ${conflict} / 失败 ${failed}"
+          }
+
+          # ----------------------------------------------------------------------------
+          # 标签辅助
+          # ----------------------------------------------------------------------------
+          # 判断某个 commit 是否包含 .github/workflows/ 下的文件。
+          # 若包含，则用 GITHUB_TOKEN 创建指向它的引用会被 GitHub 拒绝
+          # （"refusing to allow a GitHub App to create or update workflow ... without 'workflows' permission"）。
+          tag_has_workflow() {
+            local sha="$1"
+            [[ -n "$sha" ]] || return 1
+            local n
+            n="$(git_read ls-tree -r --name-only "$sha" -- .github/workflows/ 2>/dev/null | wc -l | tr -d ' ')"
+            [[ "$n" != "0" ]]
+          }
+
+          # ----------------------------------------------------------------------------
+          # 主流程
+          # ----------------------------------------------------------------------------
+          sync_main() {
+            # 先加载配置（默认值 + 环境变量覆盖），否则后续读取到的都是空值
+            selfsync_load_config
+
+            SYNC_STARTED_AT="$(_ts)"
+
+            section "Self-Sync 启动"
+            log_info "fork       : ${SELFSYNC_FORK_SLUG:-<本地仓库>}"
+            log_info "upstream   : ${SELFSYNC_UPSTREAM_SLUG:-${SELFSYNC_UPSTREAM_URL}}"
+            log_info "默认分支   : ${SELFSYNC_DEFAULT_BRANCH}"
+            log_info "分支模式   : ${SELFSYNC_DEFAULT_BRANCH_MODE}"
+            log_info "dry-run    : ${SELFSYNC_DRY_RUN}"
+
+            if [[ "$SELFSYNC_DRY_RUN" == "true" ]]; then
+              gh_note "dry-run 模式：不会写入任何远端"
+            fi
+
+            sync_setup_remotes || return 1
+
+            # L2 防护：安装 pre-push 阻断钩子
+            guard_install_prepush_hook
+
+            sync_fetch || return 1
+
+            sync_update_default_branch "$SELFSYNC_DEFAULT_BRANCH" || true
+            sync_sync_branches "$SELFSYNC_DEFAULT_BRANCH" || true
+            sync_sync_tags || true
+
+            # 关键：推送完成后，本地 refs/remotes/origin/* 仍是「检出时」的旧值，
+            # 而校验阶段（R1~R5）正是读取这些本地跟踪引用来判断远端真实状态的。
+            # 若不刷新，即使推送成功，校验也会读到推送前的旧状态而误报失败。
+            # 这里用非 --prune 的 fetch 刷新 origin 跟踪引用（绝不清理引用，删除阻断不受影响）。
+            sync_refresh_origin_refs
+
+            SYNC_FINISHED_AT="$(_ts)"
+            section "同步阶段完成"
+            return 0
+          }
+
+          # ----------------------------------------------------------------------------
+          # 刷新 origin 跟踪引用
+          # ----------------------------------------------------------------------------
+          # 仅更新本地 refs/remotes/origin/* 以反映推送后的真实远端状态，不使用 --prune，
+          # 因此不会删除任何本地引用（删除阻断逻辑不受影响）。
+          sync_refresh_origin_refs() {
+            section "刷新本地 origin 跟踪引用（读取同步后的真实远端状态）"
+            if ! git_read fetch origin "+refs/heads/*:refs/remotes/origin/*"; then
+              log_warn "刷新 origin 跟踪引用失败，校验阶段可能读到推送前的旧状态"
+              return 1
+            fi
+            log_ok "origin 跟踪引用已刷新"
+          }
+
+          # --------------------------------------------------------------------------
+          # 内联来源: verify.sh —— 一致性校验
+          # --------------------------------------------------------------------------
+          # =============================================================================
+          # verify.sh —— 一致性校验
+          #
+          # 校验规则（任一不满足 → 校验失败 → 触发告警）：
+          #   R1  默认分支：相对上游**恰好领先 1 个提交**，且该提交就是工具提交
+          #       （差异文件集合 == {工作流文件}，提交信息含标识符）
+          #   R2  非默认分支：与上游同名分支**完全一致**（ahead=0 且 behind=0）
+          #   R3  分支集合：上游稳定分支 ⊆ fork 分支集合
+          #       （fork 独有的分支不算失败——删除被阻断，属已记录的偏差）
+          #   R4  标签：上游稳定标签 ⊆ fork 标签集合，且同名标签内容一致
+          #   R5  删除阻断自检：确认同步过程中未发生任何删除
+          #
+          # 退出码：0 = 全部通过；1 = 存在校验失败
+          #
+          # 依赖：common.sh guard.sh
+          # =============================================================================
+
+          [[ -n "${_SELFSYNC_VERIFY_LOADED:-}" ]] && return 0
+          _SELFSYNC_VERIFY_LOADED=1
+
+          declare -gA VERIFY_RESULT=()      # 规则 -> PASS/FAIL/SKIP
+          declare -gA VERIFY_DETAIL=()      # 规则 -> 说明
+          declare -g VERIFY_FAILED=0
+          declare -g VERIFY_CHECKS=0
+
+          verify_record() {
+            local rule="$1" result="$2" detail="$3"
+            VERIFY_RESULT["$rule"]="$result"
+            VERIFY_DETAIL["$rule"]="$detail"
+            VERIFY_CHECKS=$((VERIFY_CHECKS+1))
+            # 输出统一带状态标记，便于日志阅读与自动化断言
+            case "$result" in
+              PASS) log_ok   "[$rule] PASS —— $detail" ;;
+              FAIL) log_err  "[$rule] FAIL —— $detail"; VERIFY_FAILED=1 ;;
+              SKIP) log_warn "[$rule] SKIP —— $detail" ;;
+            esac
+          }
+
+          # ----------------------------------------------------------------------------
+          # R1：默认分支 —— 恰好领先 1 个工具提交
+          # ----------------------------------------------------------------------------
+          verify_default_branch() {
+            local def="$1"
+            local upstream_ref="refs/remotes/upstream/${def}"
+            # 校验的是**远端 fork 的实际状态**，必须以远端跟踪引用为准
+            local origin_ref="refs/remotes/origin/${def}"
+
+            if ! git_read rev-parse --verify --quiet "$upstream_ref" >/dev/null; then
+              verify_record "R1" "SKIP" "上游无默认分支 ${def}，跳过"
+              return 0
+            fi
+            if ! git_read rev-parse --verify --quiet "$origin_ref" >/dev/null; then
+              verify_record "R1" "FAIL" "fork 缺少默认分支 ${def}"
+              return 1
+            fi
+
+            local up_sha or_sha
+            up_sha="$(git_read rev-parse "$upstream_ref")"
+            or_sha="$(git_read rev-parse "$origin_ref")"
+
+            # 领先数必须恰好为 1
+            local ahead behind
+            ahead="$(git_read rev-list --count "$up_sha..$or_sha")"
+            behind="$(git_read rev-list --count "$or_sha..$up_sha")"
+
+            if [[ "$behind" != "0" ]]; then
+              verify_record "R1" "FAIL" "默认分支落后上游 ${behind} 个提交（同步未生效）"
+              return 1
+            fi
+            if [[ "$ahead" != "1" ]]; then
+              verify_record "R1" "FAIL" "默认分支应恰好领先上游 1 个提交，实际领先 ${ahead} 个（允许多出的仅为工具提交）"
+              return 1
+            fi
+
+            # 那唯一一个提交必须是工具提交
+            local tool_commit
+            tool_commit="$(git_read rev-list "$up_sha..$or_sha" | head -1)"
+
+            # 1) 提交信息含标识符
+            local msg
+            msg="$(git_read log -1 --format='%s' "$tool_commit")"
+            if [[ "$msg" != *"$SELFSYNC_COMMIT_MARKER"* ]]; then
+              verify_record "R1" "FAIL" "多出的提交不是工具提交（提交信息 '${msg}' 未包含标识符 '${SELFSYNC_COMMIT_MARKER}'）"
+              return 1
+            fi
+
+            # 2) 差异文件集合必须恰好是 {本工具工作流文件} ∪ {上游 .github/workflows/ 下被剔除的文件}
+            #    本工具文件本身也在 .github/workflows/ 下，因此不能用「过滤掉所有 .github/workflows/
+            #    文件后应为空」这种写法（会把本工具文件也误删）。正确做法：
+            #    ① 任何不在 .github/workflows/ 下的差异文件都属异常
+            #    ② 本工具工作流文件必须出现在差异中
+            local diff_files
+            diff_files="$(git_read diff --name-only "$up_sha" "$or_sha" | sort -u)"
+            local unexpected
+            unexpected="$(printf '%s\n' "$diff_files" | grep -v '^\.github/workflows/' | grep -v '^$' || true)"
+            if [[ -n "$unexpected" ]]; then
+              verify_record "R1" "FAIL" "默认分支与上游的差异含非 .github/workflows/ 文件：${unexpected}"
+              return 1
+            fi
+            if ! printf '%s\n' "$diff_files" | grep -qx "$SELFSYNC_WORKFLOW_PATH"; then
+              verify_record "R1" "FAIL" "默认分支与上游的差异未包含本工具工作流文件 ${SELFSYNC_WORKFLOW_PATH}（实际：${diff_files:-（空）}）"
+              return 1
+            fi
+            local wf_diff_n
+            wf_diff_n="$(printf '%s\n' "$diff_files" | grep -c '^\.github/workflows/' || true)"
+            verify_record "R1" "PASS" "默认分支 ${def} = 上游 ${up_sha:0:8} + 1 个工具提交（${tool_commit:0:8}）；另有 ${wf_diff_n} 个上游工作流文件未同步（平台限制，属预期）"
+
+            # 3) 工具提交的父提交必须是上游 tip
+            local parent
+            parent="$(git_read rev-parse "${tool_commit}^")"
+            if [[ "$parent" != "$up_sha" ]]; then
+              verify_record "R1" "FAIL" "工具提交的父提交 ${parent:0:8} 与上游 tip ${up_sha:0:8} 不符"
+              return 1
+            fi
+
+            verify_record "R1" "PASS" "默认分支 ${def} = 上游 ${up_sha:0:8} + 1 个工具提交（${tool_commit:0:8}，差异文件仅工作流文件）"
+            return 0
+          }
+
+          # ----------------------------------------------------------------------------
+          # R2：非默认分支 —— 与上游完全一致
+          # ----------------------------------------------------------------------------
+          verify_branches() {
+            local def="$1"
+            local branches=()
+            mapfile -t branches < <(sync_list_stable_upstream_branches)
+
+            local checked=0 failed=0
+            local branch up_sha or_sha
+
+            for branch in "${branches[@]}"; do
+              [[ "$branch" == "$def" ]] && continue
+              up_sha="$(git_read rev-parse --verify "refs/remotes/upstream/${branch}" 2>/dev/null || true)"
+              [[ -n "$up_sha" ]] || continue
+
+              if ! git_read rev-parse --verify --quiet "refs/remotes/origin/${branch}" >/dev/null; then
+                verify_record "R2:${branch}" "FAIL" "fork 缺少分支 ${branch}"
+                failed=$((failed+1))
+                continue
+              fi
+              or_sha="$(git_read rev-parse "refs/remotes/origin/${branch}")"
+
+              if [[ "$up_sha" == "$or_sha" ]]; then
+                verify_record "R2:${branch}" "PASS" "分支 ${branch} 与上游完全一致（${up_sha:0:8}）"
+                checked=$((checked+1))
+                continue
+              fi
+
+              local ahead behind
+              ahead="$(git_read rev-list --count "$up_sha..$or_sha")"
+              behind="$(git_read rev-list --count "$or_sha..$up_sha")"
+              verify_record "R2:${branch}" "FAIL" "分支 ${branch} 与上游不一致（fork 独有 ${ahead} 提交 / 落后 ${behind} 提交）"
+              failed=$((failed+1))
+            done
+
+            if [[ $failed -eq 0 ]]; then
+              log_ok "R2 全部通过：${checked} 个非默认分支与上游一致"
+            else
+              log_err "R2 有 ${failed} 个分支与上游不一致"
+            fi
+          }
+
+          # ----------------------------------------------------------------------------
+          # R3：分支集合覆盖
+          # ----------------------------------------------------------------------------
+          verify_branch_set() {
+            local def="$1"
+            local upstream_branches origin_branches
+            mapfile -t upstream_branches < <(sync_list_stable_upstream_branches)
+            mapfile -t origin_branches < <(sync_list_origin_branches)
+
+            local missing=()
+            local b
+            for b in "${upstream_branches[@]}"; do
+              local found=0 o
+              for o in "${origin_branches[@]}"; do
+                [[ "$o" == "$b" ]] && { found=1; break; }
+              done
+              [[ $found -eq 0 ]] && missing+=("$b")
+            done
+
+            if [[ ${#missing[@]} -gt 0 ]]; then
+              verify_record "R3" "FAIL" "fork 缺少上游稳定分支：${missing[*]}"
+            else
+              verify_record "R3" "PASS" "上游 ${#upstream_branches[@]} 个稳定分支全部存在于 fork"
+            fi
+
+            # fork 独有分支：上游已删除，但删除被阻断 → 记为偏差
+            local extra=()
+            # 判断「上游是否还存在该分支」必须用**未过滤**的上游分支集
+            # （ls-remote --heads upstream 的原始结果），不能用上面经过 include/exclude
+            # 白名单过滤后的 ${upstream_branches[@]}。否则会把「上游仍然存在、只是不在
+            # 稳定分支白名单里」的分支（如 MusicFree 的 draggable-flatlist /
+            # maotoumao-patch-1、ACL4SSR 的 rm）误报成「上游已删除」，措辞错误会误导排查。
+            local live_upstream=()
+            mapfile -t live_upstream < <(git_read ls-remote --heads upstream 2>/dev/null \
+              | awk '{print $2}' | sed 's|refs/heads/||' | sort -u)
+            for o in "${origin_branches[@]}"; do
+              [[ "$o" == "$def" ]] && continue
+              local found=0
+              for b in "${live_upstream[@]}"; do
+                [[ "$b" == "$o" ]] && { found=1; break; }
+              done
+              [[ $found -eq 0 ]] && extra+=("$o")
+            done
+            if [[ ${#extra[@]} -gt 0 ]]; then
+              if [[ "$SELFSYNC_REQUIRE_EXACT_BRANCH_SET" == "true" ]]; then
+                verify_record "R3-exact" "FAIL" "fork 存在上游已删除的分支：${extra[*]}（严格模式要求完全一致）"
+              else
+                verify_record "R3-exact" "SKIP" "fork 存在上游已删除的分支（保留，删除被阻断）：${extra[*]}"
+              fi
+            fi
+          }
+
+          # ----------------------------------------------------------------------------
+          # R4：标签
+          # ----------------------------------------------------------------------------
+          verify_tags() {
+            if [[ "$SELFSYNC_SYNC_TAGS" != "true" ]]; then
+              verify_record "R4" "SKIP" "标签同步已关闭，跳过校验"
+              return 0
+            fi
+
+            local upstream_tags=()
+            mapfile -t upstream_tags < <(
+              git_read for-each-ref --format='%(refname:strip=3)' refs/upstream-mirror/tags \
+                | while read -r t; do is_stable_tag "$t" && echo "$t"; done | sort -u
+            )
+
+            local missing=() conflict=() tag
+
+            # ⚠️ 关键：校验的是**远端 fork 的真实标签状态**，必须以 ls-remote 为准。
+            # 不能用本地 refs/tags/* 比较，原因：
+            #   ① 覆盖标签后，本地 ref 不会被推送更新，仍指向旧 SHA → 假冲突
+            #      （且该假冲突会在每次运行时重复出现，永远无法自愈）
+            #   ② 新建标签后，本地根本没有该 ref → 假缺失
+            # 与 R5 一致，R4 也以远端实际状态为准。
+            local -A remote_tags=()
+            local line tagname
+            while read -r line; do
+              [[ -z "$line" ]] && continue
+              tagname="$(printf '%s' "$line" | awk '{print $2}')"
+              [[ "$tagname" == refs/tags/* ]] || continue
+              # 附注标签会额外输出一行 ^{}（剥离后的 commit），与标签对象 SHA 不同，需剔除
+              [[ "$tagname" == *'^{}' ]] && continue
+              tagname="${tagname#refs/tags/}"
+              remote_tags["$tagname"]="$(printf '%s' "$line" | awk '{print $1}')"
+            done < <(git_read ls-remote --tags origin 2>/dev/null | grep -v '\^{}')
+
+            for tag in "${upstream_tags[@]}"; do
+              local up_sha or_sha=""
+              up_sha="$(git_read rev-parse --verify "refs/upstream-mirror/tags/${tag}" 2>/dev/null || true)"
+              [[ -n "$up_sha" ]] || continue
+              or_sha="${remote_tags[$tag]:-}"
+              if [[ -z "$or_sha" ]]; then
+                missing+=("$tag")
+              elif [[ "$up_sha" != "$or_sha" ]]; then
+                conflict+=("${tag}(fork:${or_sha:0:7}/up:${up_sha:0:7})")
+              fi
+            done
+
+            if [[ ${#missing[@]} -gt 0 ]]; then
+              verify_record "R4" "FAIL" "fork 缺少上游标签：${missing[*]}"
+            elif [[ ${#conflict[@]} -gt 0 ]]; then
+              verify_record "R4" "FAIL" "标签内容冲突：${conflict[*]}"
+            else
+              verify_record "R4" "PASS" "上游 ${#upstream_tags[@]} 个稳定标签全部镜像且内容一致"
+            fi
+          }
+
+          # ----------------------------------------------------------------------------
+          # R5：删除阻断自检
+          # ----------------------------------------------------------------------------
+          # 检查两件事：
+          #   1. 本地跟踪引用中，上游**仍然存在**的分支一个都不能少
+          #      （由于禁用 --prune，本地会保留上游已删除分支的引用，这是预期的；
+          #        真正要防的是「本地把还在的分支弄丢了」）
+          #   2. fork 侧不得出现「本地跟踪引用里有、但远端实际没有」的分支
+          #      —— 这说明有删除动作被传递了出去
+          verify_no_deletion() {
+            local def="$1"
+
+            # 上游实时存在的分支
+            local upstream_now=()
+            mapfile -t upstream_now < <(git_read ls-remote --heads upstream 2>/dev/null \
+              | awk '{print $2}' | sed 's|refs/heads/||' | while read -r b; do is_stable_branch "$b" && echo "$b"; done)
+
+            # 1) 上游还在的分支，本地跟踪引用必须完整
+            local missing=0 b
+            for b in "${upstream_now[@]}"; do
+              git_read rev-parse --verify --quiet "refs/remotes/upstream/${b}" >/dev/null 2>&1 || missing=$((missing+1))
+            done
+
+            if [[ $missing -gt 0 ]]; then
+              verify_record "R5" "FAIL" "有 ${missing} 个上游分支在本地跟踪引用中缺失（可能发生了错误清理）"
+              return 1
+            fi
+
+            # 2) fork 远端实际有的分支数 ≥ 本地 origin 跟踪引用数
+            #    若远端少了，说明发生过删除（删除阻断失效）
+            local remote_heads local_heads
+            remote_heads="$(git_read ls-remote --heads origin 2>/dev/null | grep -c . || echo 0)"
+            local_heads="$(git_read for-each-ref --format='%(refname)' refs/remotes/origin 2>/dev/null \
+                           | grep -v '/HEAD$' | grep -c . || echo 0)"
+
+            if [[ "$remote_heads" -lt "$local_heads" ]]; then
+              verify_record "R5" "FAIL" "远端分支数(${remote_heads}) 少于本地跟踪引用数(${local_heads})，检测到删除动作被传递"
+              return 1
+            fi
+
+            verify_record "R5" "PASS" "无引用被删除：上游现存 ${#upstream_now[@]} 个分支跟踪完整，fork 远端 ${remote_heads} 个分支 ≥ 本地记录 ${local_heads} 个"
+            return 0
+          }
+
+          # ----------------------------------------------------------------------------
+          # 汇总
+          # ----------------------------------------------------------------------------
+          verify_main() {
+            section "一致性校验"
+            local def="$1"
+
+            verify_default_branch "$def"
+            verify_branches "$def"
+            verify_branch_set "$def"
+            verify_tags
+            verify_no_deletion "$def"
+
+            section "校验汇总"
+            local rule
+            for rule in R1 R2 R3 R4 R5; do
+              local r="${VERIFY_RESULT[$rule]:-SKIP}"
+              local d="${VERIFY_DETAIL[$rule]:-}"
+              [[ -n "$d" ]] && printf '  %-6s %s  %s\n' "$rule" "$r" "$d"
+            done
+
+            if [[ $VERIFY_FAILED -eq 0 ]]; then
+              log_ok "校验全部通过（${VERIFY_CHECKS} 项检查）"
+              return 0
+            fi
+            log_err "校验失败（${VERIFY_CHECKS} 项检查中存在不通过项）"
+            return 1
+          }
+
+          # --------------------------------------------------------------------------
+          # 内联来源: notify.sh —— 告警与通知
+          # --------------------------------------------------------------------------
+          # =============================================================================
+          # notify.sh —— 告警与通知
+          #
+          # 告警通道（按可用性依次尝试）：
+          #   1. GitHub Actions 注解 —— 出现在运行日志与 PR 中
+          #   2. GitHub Issue        —— 在仓库里开/更新一条 issue（可长期追踪）
+          #   3. Webhook             —— 推送到自定义 HTTP 端点（钉钉/飞书/Slack 均可）
+          #   4. 步骤摘要            —— 写入运行摘要，便于事后回溯
+          #
+          # 依赖：common.sh
+          # =============================================================================
+
+          [[ -n "${_SELFSYNC_NOTIFY_LOADED:-}" ]] && return 0
+          _SELFSYNC_NOTIFY_LOADED=1
+
+          # 生成 issue 标题（同一仓库同一问题复用同一 issue）
+          notify_issue_title() {
+            local prefix="$SELFSYNC_ALERT_TITLE_PREFIX"
+            local slug="${SELFSYNC_FORK_SLUG:-repo}"
+            printf '%s %s 同步校验失败' "$prefix" "$slug"
+          }
+
+          # ----------------------------------------------------------------------------
+          # GitHub Issue
+          # ----------------------------------------------------------------------------
+          notify_create_issue() {
+            local title="$1" body="$2"
+
+            if [[ "$SELFSYNC_ALERT_ISSUE_ENABLED" != "true" ]]; then
+              log_debug "Issue 告警已关闭"
+              return 0
+            fi
+
+            local token="${GITHUB_TOKEN:-${GH_TOKEN:-}}"
+            if [[ -z "$token" ]]; then
+              log_warn "无 GITHUB_TOKEN，跳过 Issue 告警"
+              return 1
+            fi
+            if [[ -z "$SELFSYNC_FORK_SLUG" ]]; then
+              log_warn "未配置 fork slug，跳过 Issue 告警"
+              return 1
+            fi
+
+            local api="https://api.github.com"
+            local auth=(-H "Authorization: Bearer ${token}"
+                        -H "Accept: application/vnd.github+json"
+                        -H "X-GitHub-Api-Version: 2022-11-28")
+
+            # 查找是否已有同标题的 open issue
+            local existing
+            existing="$(curl -sS "${auth[@]}" \
+              "${api}/repos/${SELFSYNC_FORK_SLUG}/issues?state=open&per_page=100" 2>/dev/null \
+              | grep -F "\"title\": \"${title}\"" | head -1 || true)"
+
+            if [[ -n "$existing" ]]; then
+              local number
+              number="$(printf '%s' "$existing" | grep -o '"number": [0-9]*' | head -1 | grep -o '[0-9]*')"
+              if [[ -n "$number" ]]; then
+                log_info "复用已有 Issue #${number}"
+                curl -sS -X POST "${auth[@]}" \
+                  "${api}/repos/${SELFSYNC_FORK_SLUG}/issues/${number}/comments" \
+                  -d "$(notify_json_body "${body}")" >/dev/null 2>&1 \
+                  && { log_ok "已在 Issue #${number} 追加评论"; return 0; }
+              fi
+            fi
+
+            # 新建 issue
+            local payload
+            payload="$(printf '{"title":"%s","body":"%s","labels":["%s"]}' \
+              "$(notify_escape "$title")" "$(notify_escape "$body")" "$SELFSYNC_ALERT_ISSUE_LABEL")"
+            local resp
+            resp="$(curl -sS -X POST "${auth[@]}" \
+              "${api}/repos/${SELFSYNC_FORK_SLUG}/issues" -d "$payload" 2>/dev/null || true)"
+            if printf '%s' "$resp" | grep -q '"number"'; then
+              log_ok "已创建 Issue：$(printf '%s' "$resp" | grep -o '"html_url": "[^"]*"' | head -1 | cut -d'"' -f4)"
+              return 0
+            fi
+            log_warn "创建 Issue 失败：$(printf '%s' "$resp" | head -c 200)"
+            return 1
+          }
+
+          # JSON 转义（够用即可：反斜杠、引号、换行、控制字符）
+          notify_escape() {
+            local s="$1"
+            s="${s//\\/\\\\}"
+            s="${s//\"/\\\"}"
+            s="${s//$'\n'/\\n}"
+            s="${s//$'\r'/\\r}"
+            s="${s//$'\t'/\\t}"
+            printf '%s' "$s"
+          }
+
+          notify_json_body() {
+            local body="$1"
+            printf '{"body":"%s"}' "$(notify_escape "$body")"
+          }
+
+          # ----------------------------------------------------------------------------
+          # Webhook
+          # ----------------------------------------------------------------------------
+          notify_webhook() {
+            local title="$1" body="$2"
+            local url="${!SELFSYNC_ALERT_WEBHOOK_SECRET:-}"
+
+            if [[ -z "$url" ]]; then
+              log_debug "未配置 webhook secret（${SELFSYNC_ALERT_WEBHOOK_SECRET}），跳过"
+              return 0
+            fi
+
+            local payload
+            case "$SELFSYNC_ALERT_WEBHOOK_FORMAT" in
+              dingtalk|feishu)
+                payload="$(printf '{"msgtype":"text","text":{"content":"%s\\n%s"}}' \
+                  "$(notify_escape "$title")" "$(notify_escape "$body")")" ;;
+              slack)
+                payload="$(printf '{"text":"%s\n%s"}' \
+                  "$(notify_escape "$title")" "$(notify_escape "$body")")" ;;
+              *)
+                payload="$(printf '{"title":"%s","message":"%s"}' \
+                  "$(notify_escape "$title")" "$(notify_escape "$body")")" ;;
+            esac
+
+            if curl -sS -X POST -H "Content-Type: application/json" -d "$payload" "$url" >/dev/null 2>&1; then
+              log_ok "Webhook 通知已发送"
+              return 0
+            fi
+            log_warn "Webhook 通知发送失败"
+            return 1
+          }
+
+          # ----------------------------------------------------------------------------
+          # 报告
+          # ----------------------------------------------------------------------------
+          notify_write_summary() {
+            local title="$1" body="$2"
+            local dir="$SELFSYNC_REPORT_DIR"
+            ensure_dir "$dir"
+            write_atomic "${dir}/report.md" "${title}
+
+          ${body}
+          "
+            log_debug "报告已写入 ${dir}/report.md"
+
+            # 写入 Actions 运行摘要
+            if [[ -n "${GITHUB_STEP_SUMMARY:-}" ]]; then
+              {
+                printf '## %s\n\n' "$title"
+                printf '```\n%s\n```\n' "$body"
+              } >> "$GITHUB_STEP_SUMMARY"
+            fi
+          }
+
+          # ----------------------------------------------------------------------------
+          # 汇总所有校验偏差为一段可读文本
+          # ----------------------------------------------------------------------------
+          notify_collect_deviations() {
+            local out=""
+            local key
+            for key in "${!SYNC_DEVIATIONS[@]}"; do
+              out+="  - ${key}: ${SYNC_DEVIATIONS[$key]}"$'\n'
+            done
+            [[ -z "$out" ]] && out="  （无）"$'\n'
+            printf '%s' "$out"
+          }
+
+          notify_collect_failures() {
+            local out=""
+            local rule
+            for rule in "${!VERIFY_RESULT[@]}"; do
+              if [[ "${VERIFY_RESULT[$rule]}" == "FAIL" ]]; then
+                out+="  - [${rule}] ${VERIFY_DETAIL[$rule]}"$'\n'
+              fi
+            done
+            [[ -z "$out" ]] && out="  （无）"$'\n'
+            printf '%s' "$out"
+          }
+
+          # ----------------------------------------------------------------------------
+          # 对外主入口
+          # ----------------------------------------------------------------------------
+          notify_success() {
+            local body="$1"
+            local title="✅ Self-Sync 成功：${SELFSYNC_FORK_SLUG:-repo}"
+
+            gh_note "$title"
+            notify_write_summary "$title" "$body"
+            log_ok "$title"
+          }
+
+          notify_failure() {
+            local body="$1"
+            local title
+            title="$(notify_issue_title)"
+
+            gh_error "$title"
+            notify_write_summary "$title" "$body"
+
+            # Issue 告警为尽力而为，失败不影响主流程退出码
+            notify_create_issue "$title" "$body" || true
+            notify_webhook "$title" "$body" || true
+            log_err "$title"
+          }
+
+          main() {
+            selfsync_load_config
+
+            # 配置项可用环境变量覆盖（CI 里通过 env: 注入）
+            sync_main
+            local sync_rc=$?
+
+            if [[ "$sync_rc" -ne 0 ]]; then
+              local body
+              body="$(printf '同步阶段返回码: %s\n\n分支状态:\n' "$sync_rc"
+                for b in "${!SYNC_BRANCH_STATUS[@]}"; do
+                  printf '  %-40s %-10s %s\n' "$b" "${SYNC_BRANCH_STATUS[$b]}" "${SYNC_BRANCH_DETAIL[$b]}"
+                done
+                printf '\n默认分支: %s —— %s\n' "$SELFSYNC_DEFAULT_BRANCH" "$SYNC_DEFAULT_BRANCH_DETAIL"
+                printf '\n标签状态:\n'
+                for t in "${!SYNC_TAG_STATUS[@]}"; do
+                  printf '  %-40s %-10s %s\n' "$t" "${SYNC_TAG_STATUS[$t]}" "${SYNC_TAG_DETAIL[$t]}"
+                done)"
+              notify_failure "$body"
+              exit 1
+            fi
+
+            verify_main "$SELFSYNC_DEFAULT_BRANCH"
+            local verify_rc=$?
+
+            local body
+            body="$(printf '分支同步: %s\n标签同步: %s\n默认分支: %s —— %s\n\n校验失败项:\n%s\n已记录的偏差:\n%s' \
+              "${SYNC_BRANCH_SUMMARY:-n/a}" \
+              "${SYNC_TAG_SUMMARY:-n/a}" \
+              "$SELFSYNC_DEFAULT_BRANCH" \
+              "${SYNC_DEFAULT_BRANCH_DETAIL:-n/a}" \
+              "$(notify_collect_failures)" \
+              "$(notify_collect_deviations)")"
+
+            if [[ $verify_rc -ne 0 ]]; then
+              notify_failure "$body"
+              exit 1
+            fi
+
+            notify_success "$body"
+            exit 0
+          }
+
+          main "$@"
+
